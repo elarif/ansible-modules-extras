@@ -83,6 +83,12 @@ options:
             - Use s3://... if the repository is hosted on Amazon S3, added in version 2.2.
         required: false
         default: http://repo1.maven.org/maven2
+    snapshot_repository_url:
+        description:
+            - The URL of the Maven Repository to download snapshots from.
+            - Use s3://... if the repository is hosted on Amazon S3, added in version 2.2.
+        required: false
+        default: http://repo1.maven.org/maven2
     username:
         description:
             - The username to authenticate as to the Maven Repository. Use AWS secret key of the repository is hosted on S3
@@ -151,6 +157,14 @@ EXAMPLES = '''
     extension: war
     repository_url: 'https://repo.company.com/maven'
     dest: /var/lib/tomcat7/webapps/web-app.war
+
+# Download snapshot version from snapshot repository 
+- maven_artifact:
+    group_id: org.springframework
+    artifact_id: spring-core
+    version: 4.2.5.BUILD-SNAPSHOT
+    snapshot_repository_url: http://repo.spring.io/snapshot
+    dest: /tmp/
 '''
 
 class Artifact(object):
@@ -221,11 +235,14 @@ class Artifact(object):
 
 
 class MavenDownloader:
-    def __init__(self, module, base="http://repo1.maven.org/maven2"):
+    def __init__(self, module, base="http://repo1.maven.org/maven2", snapshot_base):
         self.module = module
         if base.endswith("/"):
             base = base.rstrip("/")
         self.base = base
+        if snapshot_base.endswith("/"):
+            snapshot_base = snapshot_base.rstrip("/")
+        self.snapshot_base = snapshot_base
         self.user_agent = "Maven Artifact Downloader/1.0"
 
     def _find_latest_version_available(self, artifact):
@@ -241,7 +258,7 @@ class MavenDownloader:
 
         if artifact.is_snapshot():
             path = "/%s/maven-metadata.xml" % (artifact.path())
-            xml = self._request(self.base + path, "Failed to download maven-metadata.xml", lambda r: etree.parse(r))
+            xml = self._request(self.snapshot_base + path, "Failed to download maven-metadata.xml", lambda r: etree.parse(r))
             timestamp = xml.xpath("/metadata/versioning/snapshot/timestamp/text()")[0]
             buildNumber = xml.xpath("/metadata/versioning/snapshot/buildNumber/text()")[0]
             for snapshotArtifact in xml.xpath("/metadata/versioning/snapshotVersions/snapshotVersion"):
@@ -253,13 +270,18 @@ class MavenDownloader:
 
     def _uri_for_artifact(self, artifact, version=None):
         if artifact.is_snapshot() and not version:
-            raise ValueError("Expected uniqueversion for snapshot artifact " + str(artifact))
+            raise ValueError("Expected unique version for snapshot artifact " + str(artifact))
         elif not artifact.is_snapshot():
             version = artifact.version
+        _base = self.base
+        if artifact.is_snapshot():
+           _base = self.snapshot_base
+        _path = artifact.path()
+        _artifact_filename = artifact.artifact_id + "-" + version 
         if artifact.classifier:
-            return posixpath.join(self.base, artifact.path(), artifact.artifact_id + "-" + version + "-" + artifact.classifier + "." + artifact.extension)
-
-        return posixpath.join(self.base, artifact.path(), artifact.artifact_id + "-" + version + "." + artifact.extension)
+           _artifact_filename += "-" + artifact.classifier 
+        _artifact_filename += "." + artifact.extension
+        return posixpath.join(_base, _path,  _artifact_filename)
 
     def _request(self, url, failmsg, f):
         url_to_use = url
@@ -352,28 +374,21 @@ class MavenDownloader:
 def main():
     module = AnsibleModule(
         argument_spec = dict(
-            group_id = dict(default=None),
-            artifact_id = dict(default=None),
+            group_id = dict(required=True, default=None),
+            artifact_id = dict(required=True, default=None),
             version = dict(default="latest"),
             classifier = dict(default=None),
             extension = dict(default='jar'),
-            repository_url = dict(default=None),
+            repository_url = dict(default='http://repo1.maven.org/maven2'),
+            snapshot_repository_url = dict(default=None),
             username = dict(default=None,aliases=['aws_secret_key']),
             password = dict(default=None, no_log=True,aliases=['aws_secret_access_key']),
             state = dict(default="present", choices=["present","absent"]), # TODO - Implement a "latest" state
             timeout = dict(default=10, type='int'),
-            dest = dict(type="path", default=None),
+            dest = dict(required=True, type="path", default=None),
             validate_certs = dict(required=False, default=True, type='bool'),
         )
     )
-
-    try:
-        parsed_url = urlparse(module.params["repository_url"])
-    except AttributeError as e:
-        module.fail_json(msg='url parsing went wrong %s' % e)
-
-    if parsed_url.scheme=='s3' and not HAS_BOTO:
-        module.fail_json(msg='boto3 required for this module, when using s3:// repository URLs')
 
     group_id = module.params["group_id"]
     artifact_id = module.params["artifact_id"]
@@ -381,16 +396,24 @@ def main():
     classifier = module.params["classifier"]
     extension = module.params["extension"]
     repository_url = module.params["repository_url"]
+    snapshot_repository_url = module.params["snapshot_repository_url"]
     repository_username = module.params["username"]
     repository_password = module.params["password"]
     state = module.params["state"]
     dest = module.params["dest"]
+    if not snapshot_repository_url:
+       snapshot_repository_url = repository_url
 
-    if not repository_url:
-        repository_url = "http://repo1.maven.org/maven2"
+    try:
+        parsed_url = urlparse(repository_url)
+        snapshot_parsed_url = urlparse(snapshot_repository_url)
+    except AttributeError as e:
+        module.fail_json(msg='url parsing went wrong %s' % e)
 
-    #downloader = MavenDownloader(module, repository_url, repository_username, repository_password)
-    downloader = MavenDownloader(module, repository_url)
+    if (parsed_url.scheme=='s3' or snapshot_parsed_url=='s3') and not HAS_BOTO:
+        module.fail_json(msg='boto3 required for this module, when using s3:// repository URLs')
+
+    downloader = MavenDownloader(module, repository_url, snapshot_repository_url)
 
     try:
         artifact = Artifact(group_id, artifact_id, version, classifier, extension)
@@ -412,7 +435,7 @@ def main():
 
     try:
         if downloader.download(artifact, dest):
-            module.exit_json(state=state, dest=dest, group_id=group_id, artifact_id=artifact_id, version=version, classifier=classifier, extension=extension, repository_url=repository_url, changed=True)
+            module.exit_json(state=state, dest=dest, group_id=group_id, artifact_id=artifact_id, version=version, classifier=classifier, extension=extension, repository_url=repository_url, snapshot_repository_url=snapshot_repository_url, changed=True)
         else:
             module.fail_json(msg="Unable to download the artifact")
     except ValueError as e:
