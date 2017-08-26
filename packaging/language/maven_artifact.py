@@ -308,7 +308,7 @@ class MavenDownloader:
     def chunk_report(self, bytes_so_far, chunk_size, total_size):
         percent = float(bytes_so_far) / total_size
         percent = round(percent * 100, 2)
-        sys.stdout.write("Downloaded %d of %d bytes (%0.2f%%)\r" %
+        self.module.debug("Downloaded %d of %d bytes (%0.2f%%)\r" %
                          (bytes_so_far, total_size, percent))
 
         if bytes_so_far >= total_size:
